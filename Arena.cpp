@@ -10,6 +10,7 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <set>
+namespace fs = std::filesystem;
 
 Arena::Arena() {
     m_current_round = 0;
@@ -112,54 +113,73 @@ void Arena::place_obstacles() {
 }
 
 void Arena::load_robots() {
-    // Delete old robots and close handles if any
+    // Delete old robots and unload libraries
     for (RobotBase* r : m_robots) delete r;
-    for (void* h : m_robot_handles) dlclose(h);
     m_robots.clear();
+    for (void* h : m_robot_handles) dlclose(h);
     m_robot_handles.clear();
 
-    std::vector<std::string> robot_files = {
-        "Robot_Ratboy.so",
-        "Robot_Flame_e_o.so"
-    };
-
-    std::vector<char> available_chars = {'@', '$', '#', '%', '&', '!', '^', '*', '~', '+'};
+    std::vector<char> available_chars = 
+        {'@', '$', '#', '%', '&', '!', '^', '*', '~', '+'};
     int char_index = 0;
 
-    for (const auto& filename : robot_files) {
-        void* handle = dlopen(("./" + filename).c_str(), RTLD_LAZY);
-        if (!handle) {
-            std::cerr << "dlopen failed for " << filename << std::endl;
-            continue;
+    // Scan current directory for Robot_*.so
+    for (const auto& entry : fs::directory_iterator(".")) {
+
+        if (!entry.is_regular_file()) continue;
+
+        std::string filename = entry.path().filename().string();
+
+        // match pattern Robot_XXXX.so
+        if (filename.rfind("Robot_", 0) == 0 &&
+            filename.size() > 10 &&
+            filename.substr(filename.size()-3) == ".so") 
+        {
+            std::string fullpath = "./" + filename;
+
+            void* handle = dlopen(fullpath.c_str(), RTLD_LAZY);
+            if (!handle) {
+                std::cerr << "dlopen failed for " << filename << "\n";
+                continue;
+            }
+
+            RobotFactory factory = 
+                (RobotFactory)dlsym(handle, "create_robot");
+
+            if (!factory) {
+                std::cerr << "Missing create_robot in " << filename << "\n";
+                dlclose(handle);
+                continue;
+            }
+
+            RobotBase* robot = factory();
+            if (!robot) {
+                dlclose(handle);
+                continue;
+            }
+
+            robot->set_boundaries(m_height, m_width);
+
+            // assign unique character
+            robot->m_character =
+                available_chars[char_index++ % available_chars.size()];
+
+            // name = filename without Robot_ and without .so
+            robot->m_name = filename.substr(6, filename.size() - 9);
+
+            // place robot in empty cell
+            int r, c;
+            do {
+                r = rand() % m_height;
+                c = rand() % m_width;
+            } while (get_cell(r, c) != '.');
+
+            robot->move_to(r, c);
+            set_cell(r, c, robot->m_character);
+
+            m_robots.push_back(robot);
+            m_robot_handles.push_back(handle);
         }
-
-        RobotFactory factory = (RobotFactory)dlsym(handle, "create_robot");
-        if (!factory) {
-            std::cerr << "Missing create_robot in " << filename << std::endl;
-            dlclose(handle);
-            continue;
-        }
-
-        RobotBase* robot = factory();
-        if (!robot) {
-            dlclose(handle);
-            continue;
-        }
-
-        robot->set_boundaries(m_height, m_width);
-        robot->m_character = available_chars[char_index++ % available_chars.size()];
-        robot->m_name = filename.substr(6, filename.size() - 9);
-
-        int r, c;
-        do {
-            r = rand() % m_height;
-            c = rand() % m_width;
-        } while (get_cell(r, c) != '.');
-        robot->move_to(r, c);
-        set_cell(r, c, robot->m_character);
-
-        m_robots.push_back(robot);
-        m_robot_handles.push_back(handle);
     }
 }
 
@@ -173,6 +193,18 @@ int Arena::count_living_robots() const {
 bool Arena::check_winner() const {
     return count_living_robots() == 1;
 }
+
+RobotBase* Arena::get_winner() const {
+    RobotBase* winner = nullptr;
+    for (RobotBase* r : m_robots) {
+        if (r->get_health() > 0) {
+            if (winner == nullptr) winner = r;
+            else return nullptr;  // more than one robot alive → no winner yet
+        }
+    }
+    return winner;
+}
+
 
 std::vector<RadarObj> Arena::scan_radar(int r, int c, int direction) const {
     std::vector<RadarObj> results;
@@ -277,19 +309,35 @@ void Arena::handle_shot(RobotBase* shooter, int target_r, int target_c) {
             }
         }
     }
+
     else if (weapon == hammer) {
-        for (RobotBase* rob : m_robots) {
-            int r, c;
-            rob->get_current_location(r, c);
-            if (r == target_r && c == target_c && rob->get_health() > 0) {
-                int dmg = rand() % 11 + 50;
-                rob->take_damage(dmg);
-                rob->reduce_armor(1);
-                if (rob->get_health() <= 0) set_cell(r, c, 'X');
-                break;
-            }
+    int s_r, s_c;
+    shooter->get_current_location(s_r, s_c);
+    // Check if target tile is adjacent
+    int dr = std::abs(target_r - s_r);
+    int dc = std::abs(target_c - s_c);
+    // Hammer requires the target to be in one of the 8 surrounding tiles
+    if ((dr == 0 && dc == 0) || dr > 1 || dc > 1) {
+        // Target is not adjacent → hammer misses
+        return;
+    }
+
+    for (RobotBase* rob : m_robots) {
+        int r, c;
+        rob->get_current_location(r, c);
+
+        if (r == target_r && c == target_c && rob->get_health() > 0) {
+            int dmg = rand() % 11 + 50;
+            rob->take_damage(dmg);
+            rob->reduce_armor(1);
+
+            if (rob->get_health() <= 0)
+                set_cell(r, c, 'X');
+
+            break;
         }
     }
+}
     else if (weapon == grenade && shooter->get_grenades() > 0) {
         shooter->decrement_grenades();
         for (int rr = target_r - 1; rr <= target_r + 1; ++rr) {
@@ -361,10 +409,10 @@ void Arena::run(const std::string& config_file) {
     m_current_round = 0;
 
     while (m_current_round <= m_max_rounds) {
+
         // Print arena grid
         print_arena();
 
-        // If no robots loaded, exit gracefully
         if (m_robots.empty()) {
             std::cout << "[Arena] No robots loaded. Exiting." << std::endl;
             break;
@@ -379,11 +427,12 @@ void Arena::run(const std::string& config_file) {
 
             if (robot->get_health() <= 0) {
                 std::cout << robot->m_name << " " << robot_char 
-                          << " (" << cur_r << "," << cur_c << ") - is out\n" << std::endl;
+                          << " (" << cur_r << "," << cur_c 
+                          << ") - is out\n" << std::endl;
                 continue;
             }
 
-            // Robot stats
+            // Robot Stats
             std::cout << robot->m_name << " " << robot_char 
                       << " (" << cur_r << "," << cur_c << ") "
                       << "Health: " << robot->get_health() 
@@ -402,18 +451,21 @@ void Arena::run(const std::string& config_file) {
                     char type = obj.m_type;
                     int r = obj.m_row;
                     int c = obj.m_col;
+
                     if (type == 'R') {
                         for (size_t k = 0; k < m_robots.size(); k++) {
                             int rr, cc;
                             m_robots[k]->get_current_location(rr, cc);
                             if (rr == r && cc == c && m_robots[k]->get_health() > 0) {
-                                std::cout << "R" << m_robot_characters[k] << " at " << r << "," << c;
+                                std::cout << "R" << m_robot_characters[k] 
+                                          << " at " << r << "," << c;
                                 break;
                             }
                         }
                     } else {
                         std::cout << type << " at " << r << "," << c;
                     }
+
                     if (j < radar_results.size() - 1) std::cout << " and ";
                 }
                 std::cout << std::endl;
@@ -432,12 +484,12 @@ void Arena::run(const std::string& config_file) {
                 else if (w == flamethrower) std::cout << "flamethrower";
                 std::cout << " at " << shot_row << "," << shot_col;
 
-                // Check if robot hit
                 bool hit_robot = false;
                 for (size_t k = 0; k < m_robots.size(); k++) {
                     RobotBase* target = m_robots[k];
                     int tr, tc;
                     target->get_current_location(tr, tc);
+
                     if (tr == shot_row && tc == shot_col && target->get_health() > 0) {
                         std::cout << " Hits Robot " << target->m_name 
                                   << " at " << tr << "," << tc << std::endl;
@@ -448,8 +500,10 @@ void Arena::run(const std::string& config_file) {
                 if (!hit_robot) std::cout << std::endl;
 
                 handle_shot(robot, shot_row, shot_col);
-            } else {
+            }
+            else {
                 std::cout << " not firing" << std::endl;
+
                 int move_dir, move_dist;
                 robot->get_move_direction(move_dir, move_dist);
                 if (move_dir != 0 && move_dist > 0) {
@@ -465,12 +519,44 @@ void Arena::run(const std::string& config_file) {
             std::cout << std::endl;
         }
 
+        // ---------- WINNER CHECK ----------
         if (check_winner()) {
-            std::cout << "Game Over! Winner found!" << std::endl;
-            break;
+            RobotBase* winner = get_winner();
+
+            std::cout << "=====================================\n";
+            std::cout << "           GAME OVER\n";
+            std::cout << "=====================================\n";
+
+            if (winner) {
+                int wr, wc;
+                winner->get_current_location(wr, wc);
+                std::cout << "Winner: " << winner->m_name 
+                          << " (" << winner->m_character << ") "
+                          << "at (" << wr << "," << wc << ")\n";
+            } else {
+                std::cout << "No winner — all robots destroyed.\n";
+            }
+            return;
         }
 
         m_current_round++;
         if (m_watch_live) sleep(1);
+    }
+
+    // ---------- TIME LIMIT EXCEEDED ----------
+    RobotBase* winner = get_winner();
+
+    std::cout << "=====================================\n";
+    std::cout << "           GAME OVER\n";
+    std::cout << "=====================================\n";
+
+    if (winner) {
+        int wr, wc;
+        winner->get_current_location(wr, wc);
+        std::cout << "Winner: " << winner->m_name 
+                  << " (" << winner->m_character << ") "
+                  << "at (" << wr << "," << wc << ")\n";
+    } else {
+        std::cout << "No winner — time ran out.\n";
     }
 }

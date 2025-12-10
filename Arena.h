@@ -31,6 +31,7 @@ private:
 
     // Game mechanics
     bool check_winner() const;
+    RobotBase* get_winner() const;
 
     // Radar and combat
     std::vector<RadarObj> scan_radar(int r, int c, int direction) const;
